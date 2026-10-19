@@ -1,0 +1,69 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function staffPath() { return /databases/$(database)/documents/staff/$(request.auth.uid); }
+    function initPath() { return /databases/$(database)/documents/meta/init; }
+    // Сотрудник: есть карточка в staff и доступ не закрыт
+    function isStaff() {
+      return signedIn() && exists(staffPath()) && get(staffPath()).data.get('disabled', false) != true;
+    }
+    function myRole() { return get(staffPath()).data.role; }
+    function isLead()  { return isStaff() && (myRole() == 'lead' || myRole() == 'admin'); }
+    function isAdmin() { return isStaff() && myRole() == 'admin'; }
+
+    // Одноразовая отметка первого запуска: руководителя можно создать только один раз
+    match /meta/{docId} {
+      allow get: if signedIn();
+      allow create: if signedIn() && docId == 'init' && request.resource.data.adminUid == request.auth.uid;
+    }
+
+    // Сотрудники
+    match /staff/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || isStaff());
+      allow list: if isStaff();
+      allow create: if isAdmin()
+        || (request.auth.uid == uid
+            && request.resource.data.role == 'admin'
+            && !exists(initPath())
+            && getAfter(initPath()).data.adminUid == request.auth.uid);
+      allow update: if isAdmin();
+      allow delete: if isAdmin() && request.auth.uid != uid;
+    }
+
+    // Документы
+    match /docs/{docId} {
+      allow read: if isStaff() && (
+        resource.data.owner == request.auth.uid ||
+        resource.data.get('access', 'private') == 'shared' ||
+        isLead());
+      allow create: if isStaff()
+        && request.resource.data.owner == request.auth.uid
+        && request.resource.data.status == 'draft';
+      allow update: if isStaff()
+        && request.resource.data.owner == resource.data.owner
+        && (isLead() || (resource.data.owner == request.auth.uid && resource.data.status in ['draft', 'review']))
+        && (resource.data.status != 'signed' || isAdmin())
+        && (resource.data.status != 'void' || isAdmin())
+        && (request.resource.data.status in ['draft', 'review']
+            || (request.resource.data.status == 'signed' && isLead())
+            || (request.resource.data.status == 'void' && isAdmin()));
+      allow delete: if isStaff() && (
+        (resource.data.owner == request.auth.uid && resource.data.status != 'signed') || isAdmin());
+    }
+
+    // Счётчики номеров: сотрудник может только увеличить на 1, руководитель может задать любое значение
+    match /counters/{key} {
+      allow read: if isStaff();
+      allow create: if isStaff() && (request.resource.data.n == 1 || isAdmin());
+      allow update: if isStaff() && (request.resource.data.n == resource.data.n + 1 || isAdmin());
+    }
+
+    // Настройки шапки бланка
+    match /settings/{docId} {
+      allow read: if isStaff();
+      allow write: if isAdmin();
+    }
+  }
+}
